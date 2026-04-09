@@ -1,0 +1,7 @@
+__pycache__/
+temp/
+user_data/
+data/
+resources/
+tools/
+app_config.json
