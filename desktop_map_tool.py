@@ -35,9 +35,11 @@ DEFAULT_MAP_OPACITY = 0.7
 DEFAULT_MINIMAP_SIZE = 220
 DEFAULT_MINIMAP_LEFT = 2255
 DEFAULT_MINIMAP_TOP = 89
+DEFAULT_VIEW_SCALE = 0.6
 MATCH_REFERENCE_SIZE = 278
 MATCH_TOP_K = 10
 MATCH_CAPTURE_SIZE = DEFAULT_MINIMAP_SIZE
+DEFAULT_MATCH_MAP_SIZE_1X = 6483
 MATCH_INNER_DIAMETER = 50
 MATCH_SCALE_OPTIONS = ("0.25x", "0.5x", "1x")
 MATCH_SCALE_VALUES = {
@@ -45,6 +47,7 @@ MATCH_SCALE_VALUES = {
     "0.5x": 0.5,
     "1x": 1.0,
 }
+MATCH_METHOD_OPTIONS = ("RGB", "灰度", "边缘", "梯度")
 DEFAULT_TRACK_INTERVAL_MS = 50
 DEFAULT_TRACK_SEARCH_WINDOW = 800
 DEFAULT_TRACK_MATCH_THRESHOLD = 0.08
@@ -76,19 +79,21 @@ MAJOR_COLORS = {
 }
 
 
-def get_match_map_size(source_map_size: int, capture_size: int):
-    return int(round(source_map_size / MATCH_REFERENCE_SIZE * capture_size))
+def get_match_map_size(source_map_size: int, capture_size: int, base_match_size_1x: int = DEFAULT_MATCH_MAP_SIZE_1X):
+    source_ratio = source_map_size / 8192.0
+    capture_ratio = capture_size / MATCH_CAPTURE_SIZE
+    return int(round(base_match_size_1x * source_ratio * capture_ratio))
 
 
-def get_match_map_path(source_map_size: int, capture_size: int):
-    return DATA_DIR / f"map_match_{get_match_map_size(source_map_size, capture_size)}.png"
+def get_match_map_path(source_map_size: int, capture_size: int, base_match_size_1x: int = DEFAULT_MATCH_MAP_SIZE_1X):
+    return DATA_DIR / f"map_match_{get_match_map_size(source_map_size, capture_size, base_match_size_1x)}.png"
 
 
-def ensure_match_map(source_path: Path, capture_size: int):
+def ensure_match_map(source_path: Path, capture_size: int, base_match_size_1x: int = DEFAULT_MATCH_MAP_SIZE_1X):
     with Image.open(source_path) as src:
         source_size = src.size[0]
-        target_size = get_match_map_size(source_size, capture_size)
-        target_path = get_match_map_path(source_size, capture_size)
+        target_size = get_match_map_size(source_size, capture_size, base_match_size_1x)
+        target_path = get_match_map_path(source_size, capture_size, base_match_size_1x)
         rebuild = True
         if target_path.exists():
             try:
@@ -265,9 +270,10 @@ class MiniMapSelector:
 
 
 class MiniMapMatcher:
-    def __init__(self, map_image_path: Path):
+    def __init__(self, map_image_path: Path, base_match_size_1x: int = DEFAULT_MATCH_MAP_SIZE_1X):
         self.map_image_path = map_image_path
         self.full_map = Image.open(map_image_path).convert("RGB")
+        self.base_match_size_1x = int(base_match_size_1x)
         self.top_k = MATCH_TOP_K
         self.mask_cache = {}
         self.scale_contexts = {}
@@ -276,6 +282,24 @@ class MiniMapMatcher:
         gray = image.convert("L")
         gray = gray.filter(ImageFilter.GaussianBlur(1))
         return np.asarray(gray, dtype=np.uint8)
+
+    def _prepare_capture_inputs(self, capture: Image.Image, scale_label: str):
+        if capture.width != capture.height:
+            return None
+        source_capture_size = min(capture.size)
+        if source_capture_size != MATCH_CAPTURE_SIZE:
+            capture = capture.resize((MATCH_CAPTURE_SIZE, MATCH_CAPTURE_SIZE), Image.LANCZOS)
+        scale_factor = MATCH_SCALE_VALUES.get(scale_label, 1.0)
+        target_capture_size = max(24, int(round(min(capture.size) * scale_factor)))
+        if target_capture_size != capture.width:
+            capture = capture.resize((target_capture_size, target_capture_size), Image.LANCZOS)
+        return {
+            "source_capture_size": source_capture_size,
+            "capture_size": min(capture.size),
+            "capture_pil": capture,
+            "capture_rgb": np.asarray(capture.convert("RGB"), dtype=np.uint8),
+            "capture_gray": self._preprocess(capture),
+        }
 
     def _build_feature_map(self, gray_arr: np.ndarray, feature_name: str):
         if feature_name == "gray":
@@ -292,7 +316,7 @@ class MiniMapMatcher:
     def _circle_mask(self, size: int):
         yy, xx = np.ogrid[:size, :size]
         cx = cy = size / 2.0
-        outer_radius = size / 2.0
+        outer_radius = max(1.0, size / 2.0 - 1.5)
         inner_radius = size * (MATCH_INNER_DIAMETER / DEFAULT_MINIMAP_SIZE) / 2.0
         dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
         ring = (dist2 <= outer_radius**2) & (dist2 >= inner_radius**2)
@@ -305,13 +329,19 @@ class MiniMapMatcher:
 
     def _get_scale_context(self, capture_size: int):
         if capture_size not in self.scale_contexts:
-            match_map_path, scaled_map_size = ensure_match_map(self.map_image_path, capture_size)
+            match_map_path, scaled_map_size = ensure_match_map(
+                self.map_image_path,
+                capture_size,
+                self.base_match_size_1x,
+            )
             scaled_map = Image.open(match_map_path).convert("RGB")
             scaled_rgb = np.asarray(scaled_map, dtype=np.uint8)
+            scaled_gray = self._preprocess(scaled_map)
             self.scale_contexts[capture_size] = {
                 "match_map_path": match_map_path,
                 "scaled_map_size": scaled_map_size,
                 "map_rgb_arr": scaled_rgb,
+                "map_gray_arr": scaled_gray,
             }
         return self.scale_contexts[capture_size]
 
@@ -453,6 +483,77 @@ class MiniMapMatcher:
             return None
         return float(diff[mask_bool].mean())
 
+    def _render_method_arrays(self, template_rgb: np.ndarray, patch_rgb: np.ndarray, method_label: str):
+        template_gray = self._preprocess(Image.fromarray(template_rgb, mode="RGB"))
+        patch_gray = self._preprocess(Image.fromarray(patch_rgb, mode="RGB"))
+        if method_label == "RGB":
+            template_vis = template_rgb
+            patch_vis = patch_rgb
+            error = np.abs(template_rgb.astype(np.float32) - patch_rgb.astype(np.float32))
+        elif method_label == "灰度":
+            template_vis = template_gray
+            patch_vis = patch_gray
+            error = np.abs(template_gray.astype(np.float32) - patch_gray.astype(np.float32))
+        elif method_label == "边缘":
+            template_vis = self._build_feature_map(template_gray, "edge")
+            patch_vis = self._build_feature_map(patch_gray, "edge")
+            error = np.abs(template_vis.astype(np.float32) - patch_vis.astype(np.float32))
+        else:
+            template_vis = self._build_feature_map(template_gray, "gradient")
+            patch_vis = self._build_feature_map(patch_gray, "gradient")
+            error = np.abs(template_vis.astype(np.float32) - patch_vis.astype(np.float32))
+        return template_vis, patch_vis, error
+
+    def save_debug_images(self, capture: Image.Image, result: dict, output_dir: Path, stamp: str):
+        prepared = self._prepare_capture_inputs(capture, result.get("match_scale_label", "1x"))
+        if prepared is None:
+            return {}
+        capture_size = prepared["capture_size"]
+        scale_context = self._get_scale_context(capture_size)
+        left = int(result["match_left"])
+        top = int(result["match_top"])
+        patch_rgb = scale_context["map_rgb_arr"][top : top + capture_size, left : left + capture_size]
+        if patch_rgb.shape[:2] != (capture_size, capture_size):
+            return {}
+        mask_arr = self._get_mask(capture_size)
+        template_vis, patch_vis, error_arr = self._render_method_arrays(
+            prepared["capture_rgb"],
+            patch_rgb,
+            result.get("match_method", "RGB"),
+        )
+        mask_bool = mask_arr > 0
+        if error_arr.ndim == 3:
+            error_arr = np.where(mask_bool[..., None], error_arr, 0.0)
+            max_value = float(error_arr.max())
+            if max_value > 1e-6:
+                error_img_arr = np.clip(error_arr / max_value * 255.0, 0, 255).astype(np.uint8)
+            else:
+                error_img_arr = np.zeros_like(prepared["capture_rgb"], dtype=np.uint8)
+        else:
+            error_arr = np.where(mask_bool, error_arr, 0.0)
+            if float(error_arr.max()) > 1e-6:
+                error_img_arr = np.clip(error_arr / float(error_arr.max()) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                error_img_arr = np.zeros_like(mask_arr, dtype=np.uint8)
+
+        def to_image(arr):
+            if arr.ndim == 2:
+                return Image.fromarray(arr.astype(np.uint8), mode="L")
+            return Image.fromarray(arr.astype(np.uint8), mode="RGB")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "minimap_part": output_dir / f"match_minimap_{stamp}.png",
+            "mask_part": output_dir / f"match_mask_{stamp}.png",
+            "map_patch": output_dir / f"match_patch_{stamp}.png",
+            "error_part": output_dir / f"match_error_{stamp}.png",
+        }
+        to_image(template_vis).save(paths["minimap_part"])
+        Image.fromarray(mask_arr, mode="L").save(paths["mask_part"])
+        to_image(patch_vis).save(paths["map_patch"])
+        to_image(error_img_arr).save(paths["error_part"])
+        return {key: str(path) for key, path in paths.items()}
+
     def _refine_candidates_with_rgb(self, candidates: list[dict], template_rgb: np.ndarray, map_rgb_arr: np.ndarray, match_mask: np.ndarray):
         if not candidates:
             return []
@@ -486,23 +587,21 @@ class MiniMapMatcher:
         self,
         capture: Image.Image,
         scale_label: str = "1x",
+        method_label: str = "RGB",
         local_center_map=None,
         local_window_map=None,
         progress_cb=None,
     ):
         overall_started = time.perf_counter()
-        if capture.width != capture.height:
+        prepared = self._prepare_capture_inputs(capture, scale_label)
+        if prepared is None:
             return None
-        source_capture_size = min(capture.size)
-        if source_capture_size != MATCH_CAPTURE_SIZE:
-            capture = capture.resize((MATCH_CAPTURE_SIZE, MATCH_CAPTURE_SIZE), Image.LANCZOS)
+        source_capture_size = prepared["source_capture_size"]
         scale_factor = MATCH_SCALE_VALUES.get(scale_label, 1.0)
-        target_capture_size = max(24, int(round(min(capture.size) * scale_factor)))
-        if target_capture_size != capture.width:
-            capture = capture.resize((target_capture_size, target_capture_size), Image.LANCZOS)
-        capture_size = min(capture.size)
+        capture_size = prepared["capture_size"]
         scale_context = self._get_scale_context(capture_size)
-        capture_rgb = np.asarray(capture.convert("RGB"), dtype=np.uint8)
+        capture_rgb = prepared["capture_rgb"]
+        capture_gray = prepared["capture_gray"]
         search_region = self._build_search_region(
             scale_context["scaled_map_size"],
             capture_size,
@@ -515,10 +614,15 @@ class MiniMapMatcher:
                 search_region["top"] : search_region["bottom"],
                 search_region["left"] : search_region["right"],
             ]
+            map_gray_arr = scale_context["map_gray_arr"][
+                search_region["top"] : search_region["bottom"],
+                search_region["left"] : search_region["right"],
+            ]
             left_offset = search_region["left"]
             top_offset = search_region["top"]
         else:
             map_rgb_arr = scale_context["map_rgb_arr"]
+            map_gray_arr = scale_context["map_gray_arr"]
             left_offset = 0
             top_offset = 0
         map_shape = map_rgb_arr.shape
@@ -533,35 +637,59 @@ class MiniMapMatcher:
             )
             progress_cb(
                 f"匹配流程: {search_text} -> 原始截图 {source_capture_size}px -> 归一化 {MATCH_CAPTURE_SIZE}px -> "
-                f"倍率 {scale_label} -> 模板 {capture_size}px -> 匹配地图 {scale_context['scaled_map_size']}px "
+                f"倍率 {scale_label} -> 方法 {method_label} -> 模板 {capture_size}px -> 匹配地图 {scale_context['scaled_map_size']}px "
                 f"({scale_context['match_map_path'].name})"
             )
 
-        rgb_started = time.perf_counter()
-        result_map = cv2.matchTemplate(
-            map_rgb_arr,
-            capture_rgb,
-            cv2.TM_SQDIFF_NORMED,
-            mask=match_mask,
-        )
-        rgb_elapsed_ms = (time.perf_counter() - rgb_started) * 1000.0
-        result_map = self._sanitize_result_map(result_map)
-        if result_map is None:
-            return None
-        if progress_cb:
-            min_val, _max_val, min_loc, _max_loc = cv2.minMaxLoc(result_map)
-            probe = self._scaled_to_map(
-                min_loc[0] + left_offset,
-                min_loc[1] + top_offset,
-                min_val,
-                1,
+        if method_label == "RGB":
+            match_started = time.perf_counter()
+            result_map = cv2.matchTemplate(
+                map_rgb_arr,
+                capture_rgb,
+                cv2.TM_SQDIFF_NORMED,
+                mask=match_mask,
+            )
+            match_elapsed_ms = (time.perf_counter() - match_started) * 1000.0
+            result_map = self._sanitize_result_map(result_map)
+            if result_map is None:
+                return None
+            if progress_cb:
+                min_val, _max_val, min_loc, _max_loc = cv2.minMaxLoc(result_map)
+                probe = self._scaled_to_map(
+                    min_loc[0] + left_offset,
+                    min_loc[1] + top_offset,
+                    min_val,
+                    1,
+                    capture_size,
+                    scale_context["scaled_map_size"],
+                )
+                progress_cb(
+                    f"{method_label} score={min_val:.4f} time={match_elapsed_ms:.2f}ms "
+                    f"pos=({probe['x_map']}, {probe['y_map']})"
+                )
+        else:
+            feature_name = {"灰度": "gray", "边缘": "edge", "梯度": "gradient"}[method_label]
+            template_arr = self._build_feature_map(capture_gray, feature_name)
+            map_arr = self._build_feature_map(map_gray_arr, feature_name)
+            feature_result = self._run_feature_detection(
+                feature_name,
+                map_arr,
+                template_arr,
+                match_mask,
                 capture_size,
                 scale_context["scaled_map_size"],
+                left_offset=left_offset,
+                top_offset=top_offset,
             )
-            progress_cb(
-                f"RGB score={min_val:.4f} time={rgb_elapsed_ms:.2f}ms "
-                f"pos=({probe['x_map']}, {probe['y_map']})"
-            )
+            if feature_result is None:
+                return None
+            result_map = feature_result["result_map"]
+            match_elapsed_ms = feature_result["elapsed_ms"]
+            if progress_cb:
+                progress_cb(
+                    f"{method_label} score={feature_result['score']:.4f} time={match_elapsed_ms:.2f}ms "
+                    f"pos=({feature_result['x_map']}, {feature_result['y_map']})"
+                )
 
         top_matches = self._extract_top_candidates(
             result_map,
@@ -588,14 +716,13 @@ class MiniMapMatcher:
             "match_top": best["match_top"],
             "top_matches": top_matches,
             "feature_results": [],
-            "rgb_elapsed_ms": round(rgb_elapsed_ms, 2),
+            "match_elapsed_ms": round(float(match_elapsed_ms), 2),
             "total_elapsed_ms": round(total_elapsed_ms, 2),
-            "match_method": "rgb_only",
+            "match_method": method_label,
             "match_scale_label": scale_label,
             "match_scale_factor": scale_factor,
             "search_scope": search_scope,
             "search_window_map": int(local_window_map) if search_region and local_window_map else None,
-            "rgb_refinement_weight": 1.0,
         }
 
 
@@ -1134,13 +1261,16 @@ class DesktopMapApp:
         self.minimap_size_var = tk.IntVar(value=DEFAULT_MINIMAP_SIZE)
         self.minimap_left_var = tk.IntVar(value=DEFAULT_MINIMAP_LEFT)
         self.minimap_top_var = tk.IntVar(value=DEFAULT_MINIMAP_TOP)
+        self.match_map_size_var = tk.IntVar(value=DEFAULT_MATCH_MAP_SIZE_1X)
         self.match_scale_var = tk.StringVar(value="1x")
+        self.match_method_var = tk.StringVar(value="RGB")
         self.overlay_mode_var = tk.BooleanVar(value=False)
         self.track_follow_var = tk.BooleanVar(value=True)
         self.track_interval_ms_var = tk.IntVar(value=DEFAULT_TRACK_INTERVAL_MS)
         self.track_search_window_var = tk.IntVar(value=DEFAULT_TRACK_SEARCH_WINDOW)
         self.track_match_threshold_var = tk.DoubleVar(value=DEFAULT_TRACK_MATCH_THRESHOLD)
         self.debug_mode_var = tk.BooleanVar(value=False)
+        self.error_curve_var = tk.BooleanVar(value=False)
         self.tools_expanded = tk.BooleanVar(value=False)
         self.status_expanded = tk.BooleanVar(value=False)
         self.detail_expanded = tk.BooleanVar(value=False)
@@ -1156,6 +1286,7 @@ class DesktopMapApp:
         self.overlay_marker_window = None
         self.overlay_base_canvas = None
         self.overlay_marker_canvas = None
+        self.global_search_lock = threading.Lock()
         self.tracking_active = False
         self.tracking_stop_event = None
         self.tracking_thread = None
@@ -1175,6 +1306,11 @@ class DesktopMapApp:
         self._window_save_enabled = False
         self.saved_normal_window_geometry = None
         self.saved_topmost_window_geometry = None
+        self.current_overlay_mode_state = False
+        self.error_curve_window = None
+        self.error_curve_canvas = None
+        self.error_curve_history = []
+        self.error_curve_index = 0
         self.saved_selected_sub_ids = set()
         self._load_config()
         self._load_user_selection()
@@ -1200,10 +1336,13 @@ class DesktopMapApp:
             "minimap_top": DEFAULT_MINIMAP_TOP,
             "minimap_size": DEFAULT_MINIMAP_SIZE,
             "debug_mode": False,
+            "error_curve": False,
             "icon_size": DEFAULT_ICON_SIZE,
             "map_opacity": int(DEFAULT_MAP_OPACITY * 100),
             "outline_color": "白色",
+            "match_map_size": DEFAULT_MATCH_MAP_SIZE_1X,
             "match_scale": "1x",
+            "match_method": "RGB",
             "overlay_mode": False,
             "track_follow": True,
             "track_interval_ms": DEFAULT_TRACK_INTERVAL_MS,
@@ -1236,8 +1375,13 @@ class DesktopMapApp:
         self.minimap_size_var.set(int(cfg["minimap_size"]))
         self.minimap_left_var.set(int(cfg["minimap_left"]))
         self.minimap_top_var.set(int(cfg["minimap_top"]))
+        match_map_size = int(cfg.get("match_map_size", DEFAULT_MATCH_MAP_SIZE_1X))
+        match_map_size = max(512, min(20000, match_map_size))
+        self.match_map_size_var.set(match_map_size)
         match_scale = str(cfg.get("match_scale", "1x"))
         self.match_scale_var.set(match_scale if match_scale in MATCH_SCALE_OPTIONS else "1x")
+        match_method = str(cfg.get("match_method", "RGB"))
+        self.match_method_var.set(match_method if match_method in MATCH_METHOD_OPTIONS else "RGB")
         self.overlay_mode_var.set(bool(cfg.get("overlay_mode", False)))
         self.track_follow_var.set(bool(cfg.get("track_follow", True)))
         track_interval_ms = int(cfg.get("track_interval_ms", DEFAULT_TRACK_INTERVAL_MS))
@@ -1260,6 +1404,8 @@ class DesktopMapApp:
         self.saved_normal_window_geometry = cfg.get("normal_window_geometry")
         self.saved_topmost_window_geometry = cfg.get("topmost_window_geometry")
         self.debug_mode_var.set(bool(cfg["debug_mode"]))
+        self.error_curve_var.set(bool(cfg.get("error_curve", False)))
+        self.current_overlay_mode_state = bool(self.overlay_mode_var.get())
         self.tools_expanded.set(bool(cfg["tools_expanded"]))
         self.status_expanded.set(bool(cfg["status_expanded"]))
         self.detail_expanded.set(bool(cfg["detail_expanded"]))
@@ -1283,10 +1429,13 @@ class DesktopMapApp:
             "minimap_top": int(self.minimap_top_var.get()),
             "minimap_size": int(self.minimap_size_var.get()),
             "debug_mode": bool(self.debug_mode_var.get()),
+            "error_curve": bool(self.error_curve_var.get()),
             "icon_size": int(self.icon_size_var.get()),
             "map_opacity": int(self.map_opacity_var.get()),
             "outline_color": str(self.outline_color_name_var.get()),
+            "match_map_size": int(self.match_map_size_var.get()),
             "match_scale": str(self.match_scale_var.get()),
+            "match_method": str(self.match_method_var.get()),
             "overlay_mode": bool(self.overlay_mode_var.get()),
             "track_follow": bool(self.track_follow_var.get()),
             "track_interval_ms": int(self.track_interval_ms_var.get()),
@@ -1384,7 +1533,7 @@ class DesktopMapApp:
         self.selected_sub_ids = set()
 
     def _build_matcher(self):
-        self.matcher = MiniMapMatcher(MAP_IMAGE_PATH)
+        self.matcher = MiniMapMatcher(MAP_IMAGE_PATH, self.match_map_size_var.get())
 
     def _on_map_view_change(self):
         self.refresh_status_text()
@@ -1425,6 +1574,98 @@ class DesktopMapApp:
             self.root.after_cancel(self._restore_view_after_id)
         self._restore_view_after_id = self.root.after(120, self._restore_saved_view_state)
 
+    def _apply_default_view_state(self):
+        current_canvas = self._current_map_canvas()
+        if current_canvas is None or current_canvas.viewport_width <= 1 or current_canvas.viewport_height <= 1:
+            return
+        current_canvas.restore_view_state(
+            DEFAULT_VIEW_SCALE,
+            current_canvas.map_width / 2,
+            current_canvas.map_height / 2,
+        )
+
+    def _close_error_curve_window(self):
+        if self.error_curve_window is not None:
+            self.error_curve_window.destroy()
+        self.error_curve_window = None
+        self.error_curve_canvas = None
+        if self.error_curve_var.get():
+            self.error_curve_var.set(False)
+
+    def _open_error_curve_window(self):
+        if self.error_curve_window is not None and self.error_curve_window.winfo_exists():
+            self.error_curve_window.deiconify()
+            self.error_curve_window.lift()
+            return
+        self.error_curve_window = tk.Toplevel(self.root)
+        self.error_curve_window.title("误差曲线")
+        self.error_curve_window.geometry("620x320")
+        self.error_curve_window.minsize(420, 240)
+        self.error_curve_window.protocol("WM_DELETE_WINDOW", self._close_error_curve_window)
+        self.error_curve_canvas = tk.Canvas(self.error_curve_window, bg="#fffdf8", highlightthickness=0)
+        self.error_curve_canvas.pack(fill="both", expand=True)
+        self._redraw_error_curve()
+
+    def _append_error_curve_result(self, result: dict):
+        top_matches = result.get("top_matches", [])[:3]
+        row = [float(item.get("score", 0.0)) for item in top_matches]
+        while len(row) < 3:
+            row.append(None)
+        self.error_curve_index += 1
+        self.error_curve_history.append((self.error_curve_index, row))
+        if len(self.error_curve_history) > 180:
+            self.error_curve_history = self.error_curve_history[-180:]
+        if self.error_curve_var.get():
+            self._redraw_error_curve()
+
+    def _redraw_error_curve(self):
+        if self.error_curve_canvas is None or not self.error_curve_canvas.winfo_exists():
+            return
+        canvas = self.error_curve_canvas
+        canvas.update_idletasks()
+        width = max(420, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+        canvas.delete("all")
+        left_pad, right_pad, top_pad, bottom_pad = 46, 18, 18, 34
+        plot_w = max(10, width - left_pad - right_pad)
+        plot_h = max(10, height - top_pad - bottom_pad)
+        canvas.create_rectangle(left_pad, top_pad, left_pad + plot_w, top_pad + plot_h, outline="#d6cfbf", width=1)
+        if not self.error_curve_history:
+            canvas.create_text(width / 2, height / 2, text="暂无误差数据", fill="#6c6c6c", font=("Microsoft YaHei UI", 12))
+            return
+        valid_scores = [score for _, row in self.error_curve_history for score in row if score is not None]
+        if not valid_scores:
+            canvas.create_text(width / 2, height / 2, text="暂无误差数据", fill="#6c6c6c", font=("Microsoft YaHei UI", 12))
+            return
+        min_score = min(valid_scores)
+        max_score = max(valid_scores)
+        span = max_score - min_score
+        if span < 1e-6:
+            pad = max(1e-4, abs(max_score) * 0.1 + 1e-4)
+        else:
+            pad = max(span * 0.12, 1e-4)
+        plot_min = max(0.0, min_score - pad)
+        plot_max = max_score + pad
+        plot_span = max(1e-9, plot_max - plot_min)
+        colors = ["#ff4b4b", "#2f8cff", "#30a46c"]
+        labels = ["Top1", "Top2", "Top3"]
+        count = max(1, len(self.error_curve_history) - 1)
+        for idx, (label, color) in enumerate(zip(labels, colors)):
+            points = []
+            for pos, (_frame_idx, row) in enumerate(self.error_curve_history):
+                score = row[idx]
+                if score is None:
+                    continue
+                x = left_pad + (pos / count) * plot_w
+                y = top_pad + (1.0 - (score - plot_min) / plot_span) * plot_h
+                points.extend((x, y))
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=color, width=2, smooth=True)
+            canvas.create_text(width - 70, 18 + idx * 18, text=label, fill=color, anchor="w", font=("Microsoft YaHei UI", 10, "bold"))
+        canvas.create_text(left_pad - 8, top_pad, text=f"{plot_max:.3f}", anchor="e", fill="#6c6c6c", font=("Consolas", 9))
+        canvas.create_text(left_pad - 8, top_pad + plot_h, text=f"{plot_min:.3f}", anchor="e", fill="#6c6c6c", font=("Consolas", 9))
+        canvas.create_text(left_pad + plot_w / 2, height - 12, text="最近匹配帧", fill="#6c6c6c", font=("Microsoft YaHei UI", 9))
+
     def _capture_window_geometry(self):
         try:
             target = self.root
@@ -1452,7 +1693,7 @@ class DesktopMapApp:
             pass
 
     def _on_root_configure(self, _event=None):
-        if not self._window_save_enabled or self.overlay_mode_var.get():
+        if not self._window_save_enabled:
             return
         if self._window_save_after_id is not None:
             self.root.after_cancel(self._window_save_after_id)
@@ -1675,9 +1916,11 @@ class DesktopMapApp:
             command=self.on_overlay_mode_change,
         ).pack(side="right")
 
-        self.tools_body = ttk.Frame(tools_wrap, style="Sidebar.TFrame")
+        self.tools_body = ScrollableFrame(tools_wrap)
+        self.tools_body.canvas.configure(background="#efe7d6")
+        self.tools_body.interior.configure(style="Sidebar.TFrame")
 
-        visual_wrap = ttk.Frame(self.tools_body, style="Sidebar.TFrame")
+        visual_wrap = ttk.Frame(self.tools_body.interior, style="Sidebar.TFrame")
         visual_wrap.pack(fill="x")
         visual_wrap.columnconfigure(0, weight=1)
 
@@ -1723,24 +1966,40 @@ class DesktopMapApp:
         )
         opacity_scale.grid(row=5, column=0, sticky="we")
 
-        ttk.Label(visual_wrap, text="匹配倍率", style="Info.TLabel").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="匹配地图尺寸(1x)", style="Info.TLabel").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        match_map_size_entry = ttk.Entry(visual_wrap, textvariable=self.match_map_size_var)
+        match_map_size_entry.grid(row=7, column=0, sticky="we")
+        match_map_size_entry.bind("<Return>", self.on_match_map_size_change)
+        match_map_size_entry.bind("<FocusOut>", self.on_match_map_size_change)
+
+        ttk.Label(visual_wrap, text="匹配倍率", style="Info.TLabel").grid(row=8, column=0, sticky="w", pady=(6, 0))
         match_scale_combo = ttk.Combobox(
             visual_wrap,
             textvariable=self.match_scale_var,
             values=list(MATCH_SCALE_OPTIONS),
             state="readonly",
         )
-        match_scale_combo.grid(row=7, column=0, sticky="we")
+        match_scale_combo.grid(row=9, column=0, sticky="we")
         match_scale_combo.bind("<<ComboboxSelected>>", self.on_match_scale_change)
 
-        ttk.Label(visual_wrap, text="角落文字位置", style="Info.TLabel").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="匹配方法", style="Info.TLabel").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        match_method_combo = ttk.Combobox(
+            visual_wrap,
+            textvariable=self.match_method_var,
+            values=list(MATCH_METHOD_OPTIONS),
+            state="readonly",
+        )
+        match_method_combo.grid(row=11, column=0, sticky="we")
+        match_method_combo.bind("<<ComboboxSelected>>", self.on_match_method_change)
+
+        ttk.Label(visual_wrap, text="角落文字位置", style="Info.TLabel").grid(row=12, column=0, sticky="w", pady=(6, 0))
         overlay_position_combo = ttk.Combobox(
             visual_wrap,
             textvariable=self.overlay_position_var,
             values=list(OVERLAY_POSITION_OPTIONS),
             state="readonly",
         )
-        overlay_position_combo.grid(row=9, column=0, sticky="we")
+        overlay_position_combo.grid(row=13, column=0, sticky="we")
         overlay_position_combo.bind("<<ComboboxSelected>>", self.on_overlay_position_change)
 
         ttk.Checkbutton(
@@ -1748,41 +2007,41 @@ class DesktopMapApp:
             text="追踪时地图中心跟随",
             variable=self.track_follow_var,
             command=self.on_track_setting_change,
-        ).grid(row=10, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=14, column=0, sticky="w", pady=(6, 0))
 
-        ttk.Label(visual_wrap, text="追踪间隔 (ms)", style="Info.TLabel").grid(row=11, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="追踪间隔 (ms)", style="Info.TLabel").grid(row=15, column=0, sticky="w", pady=(6, 0))
         track_interval_entry = ttk.Entry(visual_wrap, textvariable=self.track_interval_ms_var)
-        track_interval_entry.grid(row=12, column=0, sticky="we")
+        track_interval_entry.grid(row=16, column=0, sticky="we")
         track_interval_entry.bind("<Return>", self.on_track_setting_change)
         track_interval_entry.bind("<FocusOut>", self.on_track_setting_change)
 
-        ttk.Label(visual_wrap, text="局部搜索范围", style="Info.TLabel").grid(row=13, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="局部搜索范围", style="Info.TLabel").grid(row=17, column=0, sticky="w", pady=(6, 0))
         track_window_entry = ttk.Entry(visual_wrap, textvariable=self.track_search_window_var)
-        track_window_entry.grid(row=14, column=0, sticky="we")
+        track_window_entry.grid(row=18, column=0, sticky="we")
         track_window_entry.bind("<Return>", self.on_track_setting_change)
         track_window_entry.bind("<FocusOut>", self.on_track_setting_change)
 
-        ttk.Label(visual_wrap, text="局部匹配阈值", style="Info.TLabel").grid(row=15, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="局部匹配阈值", style="Info.TLabel").grid(row=19, column=0, sticky="w", pady=(6, 0))
         track_threshold_entry = ttk.Entry(visual_wrap, textvariable=self.track_match_threshold_var)
-        track_threshold_entry.grid(row=16, column=0, sticky="we")
+        track_threshold_entry.grid(row=20, column=0, sticky="we")
         track_threshold_entry.bind("<Return>", self.on_track_setting_change)
         track_threshold_entry.bind("<FocusOut>", self.on_track_setting_change)
 
-        ttk.Label(visual_wrap, text="校准框大小", style="Info.TLabel").grid(row=17, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="校准框大小", style="Info.TLabel").grid(row=21, column=0, sticky="w", pady=(6, 0))
         minimap_size_entry = ttk.Entry(visual_wrap, textvariable=self.minimap_size_var)
-        minimap_size_entry.grid(row=18, column=0, sticky="we")
+        minimap_size_entry.grid(row=22, column=0, sticky="we")
         minimap_size_entry.bind("<Return>", self.on_minimap_size_change)
         minimap_size_entry.bind("<FocusOut>", self.on_minimap_size_change)
 
-        ttk.Label(visual_wrap, text="校准框左上角 X", style="Info.TLabel").grid(row=19, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="校准框左上角 X", style="Info.TLabel").grid(row=23, column=0, sticky="w", pady=(6, 0))
         minimap_left_entry = ttk.Entry(visual_wrap, textvariable=self.minimap_left_var)
-        minimap_left_entry.grid(row=20, column=0, sticky="we")
+        minimap_left_entry.grid(row=24, column=0, sticky="we")
         minimap_left_entry.bind("<Return>", self.on_minimap_position_change)
         minimap_left_entry.bind("<FocusOut>", self.on_minimap_position_change)
 
-        ttk.Label(visual_wrap, text="校准框左上角 Y", style="Info.TLabel").grid(row=21, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(visual_wrap, text="校准框左上角 Y", style="Info.TLabel").grid(row=25, column=0, sticky="w", pady=(6, 0))
         minimap_top_entry = ttk.Entry(visual_wrap, textvariable=self.minimap_top_var)
-        minimap_top_entry.grid(row=22, column=0, sticky="we")
+        minimap_top_entry.grid(row=26, column=0, sticky="we")
         minimap_top_entry.bind("<Return>", self.on_minimap_position_change)
         minimap_top_entry.bind("<FocusOut>", self.on_minimap_position_change)
 
@@ -1791,10 +2050,17 @@ class DesktopMapApp:
             text="调试模式",
             variable=self.debug_mode_var,
             command=self.on_debug_mode_change,
-        ).grid(row=23, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=27, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Checkbutton(
+            visual_wrap,
+            text="误差曲线",
+            variable=self.error_curve_var,
+            command=self.on_error_curve_toggle,
+        ).grid(row=28, column=0, sticky="w", pady=(6, 0))
 
         self.log_toggle_button = ttk.Button(visual_wrap, text="打开日志", command=self.toggle_log_panel)
-        self.log_toggle_button.grid(row=24, column=0, sticky="we", pady=(8, 0))
+        self.log_toggle_button.grid(row=29, column=0, sticky="we", pady=(8, 0))
 
         button_bar = ttk.Frame(sidebar, style="Sidebar.TFrame")
         button_bar.grid(row=2, column=0, sticky="we", pady=(4, 10))
@@ -1977,7 +2243,10 @@ class DesktopMapApp:
             self._center_window()
         self._apply_topmost_mode(self.overlay_mode_var.get())
         self._window_save_enabled = True
-        self.root.after(0, self._restore_saved_view_state)
+        if self.saved_view_scale is None or self.saved_view_center_x is None or self.saved_view_center_y is None:
+            self.root.after(0, self._apply_default_view_state)
+        else:
+            self.root.after(0, self._restore_saved_view_state)
 
     def _append_log(self, message: str):
         if not self.log_expanded.get() or self.log_window is None or self.log_text is None:
@@ -2241,7 +2510,13 @@ class DesktopMapApp:
             self._append_log(f"调试截图已保存: {capture_path}")
 
         self._append_log("开始全图匹配...")
-        result = self.matcher.match(capture, scale_label=match_scale_label, progress_cb=self._append_log)
+        with self.global_search_lock:
+            result = self.matcher.match(
+                capture,
+                scale_label=match_scale_label,
+                method_label=self.match_method_var.get(),
+                progress_cb=self._append_log,
+            )
         if not result:
             self._append_log("匹配失败: 未找到结果")
             if track_mode:
@@ -2254,13 +2529,17 @@ class DesktopMapApp:
             f"匹配完成: scope={result.get('search_scope', 'full')}, x={result['x_map']}, y={result['y_map']}, score={result['score']:.3f}, "
             f"source={result['source_capture_size']}, normalized={result['normalized_capture_size']}, "
             f"scale={result['match_scale_label']}, template={result['template_size']}, scaled_map={result['scaled_map_size']}, "
-            f"rgb={result['rgb_elapsed_ms']:.2f}ms total={result['total_elapsed_ms']:.2f}ms"
+            f"method={result['match_method']}, match={result['match_elapsed_ms']:.2f}ms total={result['total_elapsed_ms']:.2f}ms"
         )
         if self.debug_mode_var.get() and not track_mode:
+            image_paths = self.matcher.save_debug_images(capture, result, TEMP_DIR, stamp)
+            if image_paths:
+                self._append_log(f"调试匹配图片已保存: {', '.join(image_paths.values())}")
             debug_path = TEMP_DIR / f"minimap_match_{stamp}.json"
             debug_payload = {
                 "capture_box": bbox,
                 "match_result": result,
+                "debug_images": image_paths,
             }
             debug_path.write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
             self._append_log(f"匹配结果已保存: {debug_path}")
@@ -2294,6 +2573,7 @@ class DesktopMapApp:
             result = self.matcher.match(
                 capture,
                 scale_label="1x",
+                method_label=self.match_method_var.get(),
                 local_center_map=self.tracking_last_pose,
                 local_window_map=self.track_search_window,
                 progress_cb=self._append_log if verbose_tracking_logs else None,
@@ -2309,20 +2589,33 @@ class DesktopMapApp:
         if result is None:
             if verbose_tracking_logs:
                 self._append_log(f"开始全图搜索: 倍率={full_search_scale_label}")
-            result = self.matcher.match(
-                capture,
-                scale_label=full_search_scale_label,
-                progress_cb=self._append_log if verbose_tracking_logs else None,
-            )
+            if not self.global_search_lock.acquire(blocking=False):
+                self._append_log("全图搜索跳过: 已有全图扫描进行中")
+                return None
+            try:
+                result = self.matcher.match(
+                    capture,
+                    scale_label=full_search_scale_label,
+                    method_label=self.match_method_var.get(),
+                    progress_cb=self._append_log if verbose_tracking_logs else None,
+                )
+            finally:
+                self.global_search_lock.release()
             if not result:
                 self._append_log("全图搜索失败: 未找到结果")
                 self.root.after(0, lambda: self._on_tracking_frame_failed("实时追踪未找到匹配位置"))
+                return None
+            if used_local and result["score"] > self.track_match_threshold:
+                self._append_log(
+                    f"全图搜索结果仍失锁: score={result['score']:.3f}, threshold={self.track_match_threshold:.3f}"
+                )
+                self.root.after(0, lambda: self._on_tracking_frame_failed("实时追踪仍处于失锁状态"))
                 return None
 
         self._append_log(
             f"追踪匹配完成: scope={result['search_scope']}, x={result['x_map']}, y={result['y_map']}, "
             f"score={result['score']:.3f}, "
-            f"rgb={result['rgb_elapsed_ms']:.2f}ms, "
+            f"method={result['match_method']}, match={result['match_elapsed_ms']:.2f}ms, "
             f"total={result['total_elapsed_ms']:.2f}ms"
         )
         self.tracking_last_pose = (result["x_map"], result["y_map"])
@@ -2410,6 +2703,7 @@ class DesktopMapApp:
                 self._sync_overlay_canvases()
         if current_canvas is not None:
             current_canvas.set_overlay_match_error(result.get("score"))
+        self._append_error_curve_result(result)
         end_to_end_ms = None
         ui_update_elapsed_ms = round((time.perf_counter() - ui_started) * 1000.0, 2)
         result["ui_update_elapsed_ms"] = ui_update_elapsed_ms
@@ -2429,31 +2723,33 @@ class DesktopMapApp:
             self.minimap_match_status = (
                 f"实时追踪: ({result['x_map']}, {result['y_map']}) "
                 f"方式 {result.get('search_scope', 'full')} "
+                f"方法 {result['match_method']} "
                 f"差异值 {result['score']:.3f} "
                 f"倍率 {result['match_scale_label']} "
-                f"RGB {result['rgb_elapsed_ms']:.1f}ms "
+                f"匹配 {result['match_elapsed_ms']:.1f}ms "
                 f"排队 {result.get('ui_queue_wait_ms', 0.0):.1f}ms "
                 f"地图 {result['ui_update_elapsed_ms']:.1f}ms "
                 f"搜索 {result['total_elapsed_ms']:.1f}ms "
                 f"端到端 {end_to_end_ms:.1f}ms" if end_to_end_ms is not None else
                 f"实时追踪: ({result['x_map']}, {result['y_map']}) "
                 f"方式 {result.get('search_scope', 'full')} "
+                f"方法 {result['match_method']} "
                 f"差异值 {result['score']:.3f} "
                 f"倍率 {result['match_scale_label']} "
-                f"RGB {result['rgb_elapsed_ms']:.1f}ms "
+                f"匹配 {result['match_elapsed_ms']:.1f}ms "
                 f"排队 {result.get('ui_queue_wait_ms', 0.0):.1f}ms "
                 f"地图 {result['ui_update_elapsed_ms']:.1f}ms "
                 f"搜索 {result['total_elapsed_ms']:.1f}ms"
             )
         else:
             tail = (
-                f"RGB {result['rgb_elapsed_ms']:.1f}ms "
+                f"匹配 {result['match_elapsed_ms']:.1f}ms "
                 f"排队 {result.get('ui_queue_wait_ms', 0.0):.1f}ms "
                 f"地图 {result['ui_update_elapsed_ms']:.1f}ms "
                 f"搜索 {result['total_elapsed_ms']:.1f}ms "
                 f"端到端 {end_to_end_ms:.1f}ms "
             ) if end_to_end_ms is not None else (
-                f"RGB {result['rgb_elapsed_ms']:.1f}ms "
+                f"匹配 {result['match_elapsed_ms']:.1f}ms "
                 f"排队 {result.get('ui_queue_wait_ms', 0.0):.1f}ms "
                 f"地图 {result['ui_update_elapsed_ms']:.1f}ms "
                 f"搜索 {result['total_elapsed_ms']:.1f}ms "
@@ -2461,6 +2757,7 @@ class DesktopMapApp:
             self.minimap_match_status = (
                 f"定位完成: ({result['x_map']}, {result['y_map']}) "
                 f"方式 {result.get('search_scope', 'full')} "
+                f"方法 {result['match_method']} "
                 f"差异值 {result['score']:.3f} "
                 f"原始截图 {result['source_capture_size']} "
                 f"归一化 {result['normalized_capture_size']} "
@@ -2500,10 +2797,37 @@ class DesktopMapApp:
         self._save_config()
         self.refresh_status_text()
 
+    def on_error_curve_toggle(self):
+        if self.error_curve_var.get():
+            self._open_error_curve_window()
+        else:
+            self._close_error_curve_window()
+        self._save_config()
+        self.refresh_status_text()
+
+    def on_match_map_size_change(self, _event=None):
+        try:
+            value = int(self.match_map_size_var.get())
+        except Exception:
+            value = DEFAULT_MATCH_MAP_SIZE_1X
+        value = max(512, min(20000, value))
+        self.match_map_size_var.set(value)
+        self._build_matcher()
+        self.minimap_match_status = f"匹配地图尺寸(1x): {value}"
+        self._save_config()
+        self.refresh_status_text()
+
     def on_match_scale_change(self, _event=None):
         if self.match_scale_var.get() not in MATCH_SCALE_OPTIONS:
             self.match_scale_var.set("1x")
         self.minimap_match_status = f"匹配倍率: {self.match_scale_var.get()}"
+        self._save_config()
+        self.refresh_status_text()
+
+    def on_match_method_change(self, _event=None):
+        if self.match_method_var.get() not in MATCH_METHOD_OPTIONS:
+            self.match_method_var.set("RGB")
+        self.minimap_match_status = f"匹配方法: {self.match_method_var.get()}"
         self._save_config()
         self.refresh_status_text()
 
@@ -2517,7 +2841,15 @@ class DesktopMapApp:
         self.refresh_status_text()
 
     def on_overlay_mode_change(self):
+        geometry = self._capture_window_geometry()
+        if geometry is not None:
+            if self.current_overlay_mode_state:
+                self.saved_topmost_window_geometry = geometry
+            else:
+                self.saved_normal_window_geometry = geometry
         self._apply_topmost_mode(self.overlay_mode_var.get())
+        self.current_overlay_mode_state = bool(self.overlay_mode_var.get())
+        self._apply_saved_window_geometry()
         self.minimap_match_status = f"置于上层: {'开' if self.overlay_mode_var.get() else '关'}"
         self._save_config()
         self.refresh_status_text()
@@ -2639,7 +2971,7 @@ class DesktopMapApp:
             f"当前选中子类: {len(self.selected_sub_ids)} / {len(self.sub_vars)}\n"
             f"当前显示点位: {self.current_visible_marker_count} / {len(self.points)}\n"
             f"当前底图分辨率: {self._display_map_canvas().current_lod_size if self._display_map_canvas() is not None else 0}px\n"
-            f"图标大小: {self.icon_size_var.get()}   透明度: {self.map_opacity_var.get()}%   匹配倍率: {self.match_scale_var.get()}\n"
+            f"图标大小: {self.icon_size_var.get()}   透明度: {self.map_opacity_var.get()}%   匹配倍率: {self.match_scale_var.get()}   匹配地图: {self.match_map_size_var.get()}   匹配方法: {self.match_method_var.get()}\n"
             f"追踪跟随: {'开' if self.track_follow_var.get() else '关'}   追踪间隔: {self.track_interval_ms}ms   范围: {self.track_search_window}px   阈值: {self.track_match_threshold:.3f}\n"
             f"小地图定位: {self.minimap_match_status}"
             f"{debug_lines}"
