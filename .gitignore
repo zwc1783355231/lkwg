@@ -9,3 +9,4 @@ tools/
 *.bat
 *.log
 *.pyc
+run_desktop_map_qt.bat
