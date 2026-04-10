@@ -17,6 +17,7 @@ Image.MAX_IMAGE_PIXELS = None
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
+TRANSPARENT_KEY = "#ff00ff"
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -761,16 +762,11 @@ class MapCanvas(ttk.Frame):
         self.image_pyramid = self._build_image_pyramid()
         self.current_lod_size = self.map_width
 
-        canvas_bg = "#ff00ff" if transparent_bg else "#102844"
+        canvas_bg = TRANSPARENT_KEY if transparent_bg else "#102844"
         self.canvas = tk.Canvas(self, background=canvas_bg, highlightthickness=0, cursor="fleur" if interactive_navigation else "arrow")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_resize)
-        if interactive_navigation:
-            self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
-            self.canvas.bind("<B1-Motion>", self._on_drag_move)
-            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
-            self.canvas.bind("<Button-4>", self._on_mousewheel_linux)
-            self.canvas.bind("<Button-5>", self._on_mousewheel_linux)
+        self.set_interactive_navigation(interactive_navigation)
 
         self.scale = 0.12
         self.min_scale = MIN_SCALE
@@ -800,6 +796,23 @@ class MapCanvas(ttk.Frame):
         self._composited_map_pil = None
         self._composited_map_key = None
         self._composited_map_size = (0, 0)
+
+    def set_interactive_navigation(self, enabled: bool):
+        self.interactive_navigation = bool(enabled)
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<MouseWheel>")
+        self.canvas.unbind("<Button-4>")
+        self.canvas.unbind("<Button-5>")
+        if self.interactive_navigation:
+            self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
+            self.canvas.bind("<B1-Motion>", self._on_drag_move)
+            self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+            self.canvas.bind("<Button-4>", self._on_mousewheel_linux)
+            self.canvas.bind("<Button-5>", self._on_mousewheel_linux)
+            self.canvas.configure(cursor="fleur")
+        else:
+            self.canvas.configure(cursor="arrow")
 
     def _build_image_pyramid(self):
         pyramid = {self.map_width: self.full_image}
@@ -1302,11 +1315,14 @@ class DesktopMapApp:
         self._view_save_after_id = None
         self._restore_view_after_id = None
         self._view_restore_in_progress = False
+        self._view_persistence_enabled = False
         self._window_save_after_id = None
         self._window_save_enabled = False
         self.saved_normal_window_geometry = None
         self.saved_topmost_window_geometry = None
         self.current_overlay_mode_state = False
+        self._overlay_transitioning = False
+        self._overlay_host_geometry = None
         self.error_curve_window = None
         self.error_curve_canvas = None
         self.error_curve_history = []
@@ -1320,6 +1336,10 @@ class DesktopMapApp:
         self._prepare_points()
         self._setup_style()
         self._build_layout()
+        self.normal_root_bg = self.root.cget("bg")
+        self.normal_shell_bg = self.shell.cget("bg")
+        self.normal_map_panel_bg = self.map_panel.cget("bg")
+        self.normal_map_host_bg = self.map_host.cget("bg")
         self._load_sub_icons()
         self.map_canvas = self._create_map_canvas(self.map_host)
         self.map_canvas.set_map_opacity(self.map_opacity_var.get() / 100.0)
@@ -1538,7 +1558,7 @@ class DesktopMapApp:
     def _on_map_view_change(self):
         self.refresh_status_text()
         self._sync_overlay_canvases()
-        if self._view_restore_in_progress:
+        if self._view_restore_in_progress or not self._view_persistence_enabled:
             return
         if self._view_save_after_id is not None:
             self.root.after_cancel(self._view_save_after_id)
@@ -1546,7 +1566,13 @@ class DesktopMapApp:
 
     def _persist_view_state(self):
         self._view_save_after_id = None
+        if not self._view_persistence_enabled:
+            return
         self._save_config()
+
+    def _complete_initial_view_setup(self):
+        self._view_persistence_enabled = True
+        self._persist_view_state()
 
     def _restore_saved_view_state(self):
         if self.saved_view_scale is None or self.saved_view_center_x is None or self.saved_view_center_y is None:
@@ -1564,6 +1590,7 @@ class DesktopMapApp:
                 float(self.saved_view_center_y),
             )
             self._sync_overlay_canvases()
+            self._complete_initial_view_setup()
         except Exception:
             self._schedule_restore_saved_view_state()
         finally:
@@ -1582,6 +1609,17 @@ class DesktopMapApp:
             DEFAULT_VIEW_SCALE,
             current_canvas.map_width / 2,
             current_canvas.map_height / 2,
+        )
+        self._complete_initial_view_setup()
+
+    def _reset_canvas_zoom(self, canvas: MapCanvas):
+        if canvas is None or canvas.viewport_width <= 1 or canvas.viewport_height <= 1:
+            return
+        view_state = canvas.get_view_state()
+        canvas.restore_view_state(
+            DEFAULT_VIEW_SCALE,
+            view_state["center_x"],
+            view_state["center_y"],
         )
 
     def _close_error_curve_window(self):
@@ -1669,12 +1707,31 @@ class DesktopMapApp:
     def _capture_window_geometry(self):
         try:
             target = self.root
+            if str(target.state()) == "withdrawn":
+                return self.saved_topmost_window_geometry if self.overlay_mode_var.get() else self.saved_normal_window_geometry
             target.update_idletasks()
             return {
                 "width": int(target.winfo_width()),
                 "height": int(target.winfo_height()),
                 "x": int(target.winfo_x()),
                 "y": int(target.winfo_y()),
+            }
+        except Exception:
+            return None
+
+    def _capture_map_host_geometry(self):
+        try:
+            host = self.map_host
+            host.update_idletasks()
+            width = int(host.winfo_width())
+            height = int(host.winfo_height())
+            if width <= 1 or height <= 1:
+                return None
+            return {
+                "width": width,
+                "height": height,
+                "x": int(host.winfo_rootx()),
+                "y": int(host.winfo_rooty()),
             }
         except Exception:
             return None
@@ -1693,6 +1750,7 @@ class DesktopMapApp:
             pass
 
     def _on_root_configure(self, _event=None):
+        self._sync_overlay_canvases()
         if not self._window_save_enabled:
             return
         if self._window_save_after_id is not None:
@@ -1715,34 +1773,109 @@ class DesktopMapApp:
         elif not visible and sidebar_present:
             self.shell.forget(self.sidebar)
 
+    def _ensure_overlay_base_window(self):
+        if self.overlay_base_window is not None and self.overlay_base_window.winfo_exists():
+            return
+        window = tk.Toplevel(self.root)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(bg="#102844")
+        window.bind("<Escape>", lambda _e: self._disable_topmost_mode())
+        canvas = self._create_map_canvas(
+            window,
+            render_points=False,
+            render_runtime_markers=False,
+            render_overlay_ui=False,
+            interactive_navigation=True,
+        )
+        canvas.set_map_opacity(1.0)
+        self.overlay_base_window = window
+        self.overlay_base_canvas = canvas
+
+    def _ensure_overlay_marker_window(self):
+        if self.overlay_marker_window is not None and self.overlay_marker_window.winfo_exists():
+            return
+        window = tk.Toplevel(self.root)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(bg=TRANSPARENT_KEY)
+        try:
+            window.wm_attributes("-transparentcolor", TRANSPARENT_KEY)
+        except tk.TclError:
+            pass
+        window.bind("<Escape>", lambda _e: self._disable_topmost_mode())
+        canvas = self._create_map_canvas(
+            window,
+            render_base_map=False,
+            render_points=True,
+            render_runtime_markers=True,
+            render_overlay_ui=True,
+            interactive_navigation=False,
+            transparent_bg=True,
+        )
+        self.overlay_marker_window = window
+        self.overlay_marker_canvas = canvas
+
+    def _destroy_overlay_windows(self):
+        if self.overlay_base_window is not None:
+            try:
+                self.overlay_base_window.destroy()
+            except Exception:
+                pass
+        if self.overlay_marker_window is not None:
+            try:
+                self.overlay_marker_window.destroy()
+            except Exception:
+                pass
+        self.overlay_base_window = None
+        self.overlay_base_canvas = None
+        self.overlay_marker_window = None
+        self.overlay_marker_canvas = None
+
+    def _copy_canvas_overlay_state(self, source: MapCanvas, target: MapCanvas):
+        target.copy_view_from(source)
+        target.selected_sub_ids = set(source.selected_sub_ids)
+        target.search_text = source.search_text
+        target.overlay_text = source.overlay_text
+        target.overlay_match_error = source.overlay_match_error
+        target.overlay_alert_text = source.overlay_alert_text
+        target.overlay_alert_color = source.overlay_alert_color
+        target.overlay_position = source.overlay_position
+        target.player_pose = source.player_pose
+        target.player_candidates = list(source.player_candidates)
+
     def _apply_topmost_mode(self, enabled: bool):
-        self.root.attributes("-topmost", bool(enabled))
-        self._set_sidebar_visible(not enabled)
-        bg = self.root.cget("bg")
-        self.root.configure(bg=bg)
+        self._overlay_transitioning = True
         try:
-            self.shell.configure(bg=bg)
-        except Exception:
-            pass
-        try:
-            self.root.wm_attributes("-transparentcolor", "")
-        except tk.TclError:
-            pass
-        set_window_clickthrough(self.root, False)
-        try:
-            self.root.attributes("-alpha", max(0.15, min(1.0, self.map_opacity_var.get() / 100.0)) if enabled else 1.0)
-        except tk.TclError:
-            pass
-        if isinstance(self.map_panel, tk.Frame):
-            self.map_panel.configure(bg=bg)
-        if isinstance(self.map_host, tk.Frame):
-            self.map_host.configure(bg=bg)
-        if self.map_canvas is not None:
-            self.map_canvas.render_base_map = True
-            self.map_canvas.transparent_bg = False
-            self.map_canvas.canvas.configure(background="#102844")
-            self.map_canvas._invalidate_composited_map()
-            self.map_canvas.redraw()
+            self.root.attributes("-topmost", False)
+            self._set_sidebar_visible(not enabled)
+            set_window_clickthrough(self.root, False)
+            if enabled:
+                self._overlay_host_geometry = self._capture_map_host_geometry()
+                self._ensure_overlay_base_window()
+                self._ensure_overlay_marker_window()
+                if self.overlay_base_canvas is not None and self.map_canvas is not None:
+                    self._copy_canvas_overlay_state(self.map_canvas, self.overlay_base_canvas)
+                    self._reset_canvas_zoom(self.overlay_base_canvas)
+                self._sync_overlay_canvases()
+                self.root.withdraw()
+            else:
+                if self.map_canvas is not None and self.overlay_base_canvas is not None:
+                    self._copy_canvas_overlay_state(self.overlay_base_canvas, self.map_canvas)
+                self._destroy_overlay_windows()
+                self.root.deiconify()
+                self.root.lift()
+                self._overlay_host_geometry = None
+                if self.map_canvas is not None:
+                    self.map_canvas.set_interactive_navigation(True)
+                    self.map_canvas.set_map_opacity(self.map_opacity_var.get() / 100.0)
+                    self.map_canvas.set_filters(self.selected_sub_ids, self.search_var.get().strip().lower())
+                    self.map_canvas._invalidate_composited_map()
+                    self.map_canvas.redraw()
+        finally:
+            self._overlay_transitioning = False
 
     def _disable_topmost_mode(self):
         if self.overlay_mode_var.get():
@@ -1752,13 +1885,54 @@ class DesktopMapApp:
             self.refresh_status_text()
 
     def _current_map_canvas(self):
+        if self.overlay_mode_var.get() and self.overlay_base_canvas is not None:
+            return self.overlay_base_canvas
         return self.map_canvas
 
     def _display_map_canvas(self):
         return self._current_map_canvas()
 
     def _sync_overlay_canvases(self):
-        return
+        if self._overlay_transitioning:
+            return
+        if not self.overlay_mode_var.get():
+            return
+        if (
+            self.overlay_base_window is None
+            or self.overlay_base_canvas is None
+            or self.overlay_marker_window is None
+            or self.overlay_marker_canvas is None
+        ):
+            return
+        geometry = self._overlay_host_geometry or self._capture_map_host_geometry()
+        if geometry is None:
+            return
+        self.overlay_base_window.geometry(
+            f"{geometry['width']}x{geometry['height']}+{geometry['x']}+{geometry['y']}"
+        )
+        self.overlay_marker_window.geometry(
+            f"{geometry['width']}x{geometry['height']}+{geometry['x']}+{geometry['y']}"
+        )
+        try:
+            self.overlay_base_window.attributes(
+                "-alpha",
+                max(0.15, min(1.0, self.map_opacity_var.get() / 100.0)),
+            )
+        except tk.TclError:
+            pass
+        self.overlay_base_window.deiconify()
+        self.overlay_marker_window.deiconify()
+        self.overlay_base_window.lift()
+        self.overlay_marker_window.lift()
+
+        marker_canvas = self.overlay_marker_canvas
+        base_canvas = self.overlay_base_canvas
+        marker_canvas._suspend_view_callback = True
+        try:
+            self._copy_canvas_overlay_state(base_canvas, marker_canvas)
+        finally:
+            marker_canvas._suspend_view_callback = False
+        self.overlay_base_window.lower(self.overlay_marker_window)
 
     def _create_map_canvas(self, host, on_view_change=None, **kwargs):
         canvas = MapCanvas(
@@ -1859,6 +2033,7 @@ class DesktopMapApp:
 
         self.map_host = tk.Frame(self.map_panel, bg="#f0f0f0")
         self.map_host.grid(row=0, column=0, sticky="nsew")
+        self.map_host.bind("<Configure>", lambda _event: self._sync_overlay_canvases())
 
         title_row = ttk.Frame(sidebar, style="Sidebar.TFrame")
         title_row.grid(row=0, column=0, sticky="we")
@@ -2406,7 +2581,7 @@ class DesktopMapApp:
     def fit_map(self):
         current_canvas = self._current_map_canvas()
         if current_canvas is not None:
-            current_canvas.fit_to_view()
+            self._reset_canvas_zoom(current_canvas)
             self._sync_overlay_canvases()
 
     def toggle_tracking(self):
@@ -2778,16 +2953,17 @@ class DesktopMapApp:
             if icon is not None:
                 label.configure(image=icon)
                 label.image = icon
-        current_canvas = self._current_map_canvas()
-        if current_canvas is not None:
-            current_canvas.set_icon_cache(self.sub_icon_cache, self.sub_icon_pil_cache)
+        if self.map_canvas is not None:
+            self.map_canvas.set_icon_cache(self.sub_icon_cache, self.sub_icon_pil_cache)
+        if self.overlay_base_canvas is not None:
+            self.overlay_base_canvas.set_icon_cache(self.sub_icon_cache, self.sub_icon_pil_cache)
         self._save_config()
         self.refresh_status_text()
 
     def on_map_opacity_change(self, _event=None):
         current_canvas = self._current_map_canvas()
         if current_canvas is not None:
-            current_canvas.set_map_opacity(self.map_opacity_var.get() / 100.0)
+            current_canvas.set_map_opacity(1.0 if self.overlay_mode_var.get() else self.map_opacity_var.get() / 100.0)
         if self.overlay_mode_var.get():
             self._apply_topmost_mode(True)
         self._save_config()
@@ -2834,9 +3010,10 @@ class DesktopMapApp:
     def on_overlay_position_change(self, _event=None):
         if self.overlay_position_var.get() not in OVERLAY_POSITION_OPTIONS:
             self.overlay_position_var.set(DEFAULT_OVERLAY_POSITION)
-        current_canvas = self._current_map_canvas()
-        if current_canvas is not None:
-            current_canvas.set_overlay_position(self.overlay_position_var.get())
+        if self.map_canvas is not None:
+            self.map_canvas.set_overlay_position(self.overlay_position_var.get())
+        if self.overlay_base_canvas is not None:
+            self.overlay_base_canvas.set_overlay_position(self.overlay_position_var.get())
         self._save_config()
         self.refresh_status_text()
 
@@ -2946,9 +3123,10 @@ class DesktopMapApp:
             )
         )
         self.current_visible_marker_count = visible_count
-        current_canvas = self._current_map_canvas()
-        if current_canvas is not None:
-            current_canvas.set_filters(self.selected_sub_ids, needle)
+        if self.map_canvas is not None:
+            self.map_canvas.set_filters(self.selected_sub_ids, needle)
+        if self.overlay_base_canvas is not None:
+            self.overlay_base_canvas.set_filters(self.selected_sub_ids, needle)
         self.refresh_status_text()
 
     def refresh_status_text(self):
@@ -2982,6 +3160,8 @@ class DesktopMapApp:
             current_canvas.set_overlay_text(
                 f"缩放: {display_canvas.scale * 100:.0f}%   底图: {display_canvas.current_lod_size}px"
             )
+
+        self._sync_overlay_canvases()
 
     def show_marker_detail(self, point: dict):
         self.detail_var.set(

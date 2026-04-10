@@ -1,0 +1,308 @@
+[
+  {
+    "major_id": "01",
+    "major_name": "地点",
+    "filename": "01_地点.json",
+    "total_count": 149,
+    "subcategories": [
+      {
+        "sub_id": "0101",
+        "sub_name": "庇护所",
+        "source": "bwiki",
+        "count": 32
+      },
+      {
+        "sub_id": "0102",
+        "sub_name": "小庇护所",
+        "source": "bwiki",
+        "count": 10
+      },
+      {
+        "sub_id": "0103",
+        "sub_name": "传送点",
+        "source": "bwiki",
+        "count": 35
+      },
+      {
+        "sub_id": "0104",
+        "sub_name": "炼金台",
+        "source": "bwiki",
+        "count": 20
+      },
+      {
+        "sub_id": "0105",
+        "sub_name": "副本",
+        "source": "bwiki",
+        "count": 34
+      },
+      {
+        "sub_id": "0106",
+        "sub_name": "boss",
+        "source": "17173",
+        "count": 18
+      }
+    ]
+  },
+  {
+    "major_id": "02",
+    "major_name": "可刷新采集物",
+    "filename": "02_可刷新采集物.json",
+    "total_count": 1564,
+    "subcategories": [
+      {
+        "sub_id": "0201",
+        "sub_name": "伞伞菌",
+        "source": "bwiki",
+        "count": 158
+      },
+      {
+        "sub_id": "0202",
+        "sub_name": "向阳花",
+        "source": "bwiki",
+        "count": 95
+      },
+      {
+        "sub_id": "0203",
+        "sub_name": "喵喵草",
+        "source": "bwiki",
+        "count": 73
+      },
+      {
+        "sub_id": "0204",
+        "sub_name": "喷气菇",
+        "source": "bwiki",
+        "count": 52
+      },
+      {
+        "sub_id": "0205",
+        "sub_name": "大嘴花",
+        "source": "bwiki",
+        "count": 17
+      },
+      {
+        "sub_id": "0206",
+        "sub_name": "天使草",
+        "source": "bwiki",
+        "count": 39
+      },
+      {
+        "sub_id": "0207",
+        "sub_name": "幽幽草",
+        "source": "bwiki",
+        "count": 9
+      },
+      {
+        "sub_id": "0208",
+        "sub_name": "彩玉花",
+        "source": "bwiki",
+        "count": 16
+      },
+      {
+        "sub_id": "0209",
+        "sub_name": "恶魔雪茄",
+        "source": "bwiki",
+        "count": 8
+      },
+      {
+        "sub_id": "0210",
+        "sub_name": "星霜花",
+        "source": "bwiki",
+        "count": 50
+      },
+      {
+        "sub_id": "0211",
+        "sub_name": "洋红珊瑚",
+        "source": "bwiki",
+        "count": 9
+      },
+      {
+        "sub_id": "0212",
+        "sub_name": "流星兰",
+        "source": "bwiki",
+        "count": 68
+      },
+      {
+        "sub_id": "0213",
+        "sub_name": "海星石",
+        "source": "bwiki",
+        "count": 28
+      },
+      {
+        "sub_id": "0214",
+        "sub_name": "海桑花",
+        "source": "bwiki",
+        "count": 18
+      },
+      {
+        "sub_id": "0215",
+        "sub_name": "海珊瑚",
+        "source": "bwiki",
+        "count": 21
+      },
+      {
+        "sub_id": "0216",
+        "sub_name": "海神花",
+        "source": "bwiki",
+        "count": 59
+      },
+      {
+        "sub_id": "0217",
+        "sub_name": "火焰花",
+        "source": "bwiki",
+        "count": 3
+      },
+      {
+        "sub_id": "0218",
+        "sub_name": "睡铃",
+        "source": "bwiki",
+        "count": 48
+      },
+      {
+        "sub_id": "0219",
+        "sub_name": "石耳",
+        "source": "bwiki",
+        "count": 154
+      },
+      {
+        "sub_id": "0220",
+        "sub_name": "紫莲刚玉",
+        "source": "bwiki",
+        "count": 15
+      },
+      {
+        "sub_id": "0221",
+        "sub_name": "紫雀花",
+        "source": "bwiki",
+        "count": 50
+      },
+      {
+        "sub_id": "0222",
+        "sub_name": "花星角",
+        "source": "bwiki",
+        "count": 4
+      },
+      {
+        "sub_id": "0223",
+        "sub_name": "荧光兰",
+        "source": "bwiki",
+        "count": 46
+      },
+      {
+        "sub_id": "0224",
+        "sub_name": "蓝掌",
+        "source": "bwiki",
+        "count": 47
+      },
+      {
+        "sub_id": "0225",
+        "sub_name": "蓝晶碧玺",
+        "source": "bwiki",
+        "count": 8
+      },
+      {
+        "sub_id": "0226",
+        "sub_name": "藻羽花",
+        "source": "bwiki",
+        "count": 23
+      },
+      {
+        "sub_id": "0227",
+        "sub_name": "蜜黄菌",
+        "source": "bwiki",
+        "count": 50
+      },
+      {
+        "sub_id": "0228",
+        "sub_name": "象牙花",
+        "source": "bwiki",
+        "count": 11
+      },
+      {
+        "sub_id": "0229",
+        "sub_name": "雪菇",
+        "source": "bwiki",
+        "count": 44
+      },
+      {
+        "sub_id": "0230",
+        "sub_name": "风卷草",
+        "source": "bwiki",
+        "count": 21
+      },
+      {
+        "sub_id": "0231",
+        "sub_name": "骨片",
+        "source": "bwiki",
+        "count": 14
+      },
+      {
+        "sub_id": "0232",
+        "sub_name": "黄石榴石",
+        "source": "bwiki",
+        "count": 40
+      },
+      {
+        "sub_id": "0233",
+        "sub_name": "黑晶琉璃",
+        "source": "bwiki",
+        "count": 162
+      },
+      {
+        "sub_id": "0234",
+        "sub_name": "可可果",
+        "source": "17173",
+        "count": 47
+      },
+      {
+        "sub_id": "0235",
+        "sub_name": "无花果",
+        "source": "17173",
+        "count": 39
+      },
+      {
+        "sub_id": "0236",
+        "sub_name": "魔力果",
+        "source": "17173",
+        "count": 18
+      }
+    ]
+  },
+  {
+    "major_id": "03",
+    "major_name": "一次性采集物",
+    "filename": "03_一次性采集物.json",
+    "total_count": 1871,
+    "subcategories": [
+      {
+        "sub_id": "0301",
+        "sub_name": "眠枭之星（黄）",
+        "source": "17173",
+        "count": 115
+      },
+      {
+        "sub_id": "0302",
+        "sub_name": "眠枭之星（蓝）",
+        "source": "17173",
+        "count": 266
+      },
+      {
+        "sub_id": "0303",
+        "sub_name": "果实",
+        "source": "bwiki",
+        "count": 44
+      },
+      {
+        "sub_id": "0304",
+        "sub_name": "崭新乐章",
+        "source": "17173",
+        "count": 68
+      },
+      {
+        "sub_id": "0305",
+        "sub_name": "宝箱",
+        "source": "17173",
+        "count": 1378
+      }
+    ]
+  }
+]
